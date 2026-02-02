@@ -50,8 +50,8 @@ int main()
 
     for (int i = 0; i < N * N; i++)
     {
-        hA[i] = 1.0f;
-        hB[i] = 1.0f;
+        hA[i] = 0.8f;
+        hB[i] = 0.6f;
     }
 
     float *dA, *dB, *dC;
