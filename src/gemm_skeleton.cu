@@ -22,6 +22,10 @@ using namespace nvcuda;
     }                                                                             \
   } while (0)
 
+constexpr int tile = 16;
+constexpr int BM = tile * 2;
+constexpr int BN = tile * 4;//8 warp, allocated as 4*2
+const int BK = 16;
 // ---------------------------
 // 6) Kernel signature only (no implementation)
 // ---------------------------
@@ -33,42 +37,57 @@ __global__ void gemm_kernel(const float* __restrict__ A,
     // A: [M, K] row-major
     // B: [K, N] row-major
     // C: [M, N] row-major
-    constexpr int tile = 16;
-    constexpr int BM = tile * 2;
-    const int BN = tile * 4;//8 warp, allocated as 4*2
-    const int BK = 16;
+
     int n_block_num = N/BN;
-    int m_block_num = M/BM;
-    __shared__ half smemA[BM][BK];//256*256
-    __shared__ half smemB[BN][BK];//256*256
-    int tid = blockDim.x*blockIdx.x+threadIdx.x;
+    // int m_block_num = M/BM;
+    const int lda = BK;
+    const int ldb = BN;
+    __shared__ half smemA[BM][BK];
+    __shared__ half smemB[BK][BN];
+    //int tid = blockDim.x*blockIdx.x+threadIdx.x;
     int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
+    int c_tile_y = warp_id / 4;
+    int c_tile_x = warp_id % 4;
+    //int lane_id = threadIdx.x % 32;
+    int m_pos = (blockIdx.x/n_block_num)*BM;
+    int n_pos = (blockIdx.x%n_block_num)*BN;
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
     wmma::fill_fragment(c_frag,0.0f);
 
     // move to smem
     for(int k_pos=0;k_pos<K;k_pos+=BK)
     {
-        int m_pos = (blockIdx.x/n_block_num)*BM;
-        int n_pos = (blockIdx.x%n_block_num)*BN;
         // thread num:256
         // move_num:A: BM*BK=32*16=512
-        for(int i=0;i<=BM*BK;i+=blockDim.x) // stride = blockDim.x
+        for(int i=0;i<BM*BK;i+=blockDim.x) // stride = blockDim.x
         {
-            //A start pos:(mpos,k)
-            smemA[(i+threadIdx.x)/BK][(i+threadIdx.x)%BK]=A[m_pos+(threadIdx.x/BK)][k_pos+(threadIdx.x%BK)];
+            // A start pos:(mpos,k)
+            // A[m_pos+(threadIdx.x/BK)][k_pos+(threadIdx.x%BK)]
+            int t = i+threadIdx.x;
+            smemA[t/BK][t%BK]=__float2half_rn(A[(m_pos+(t/BK))*K+k_pos+(t%BK)]);
         }
-
         // move_num:B: BN*BK=64*16=1024
-        for(int i=0;i<=BN*BK;i+=blockDim.x) // stride = blockDim.x
+        for(int i=0;i<BN*BK;i+=blockDim.x) // stride = blockDim.x
         {
-            //B start pos:(k,npos)
-            smemB[(i+threadIdx.x)/BK][(i+threadIdx.x)%BK]=B[k_pos+(threadIdx.x/BN)][n_pos+(threadIdx.x%BN)];
+            int t = i+threadIdx.x;
+            // B start pos:(k,npos)
+            // B[k_pos+(threadIdx.x/BN)][n_pos+(threadIdx.x%BN)]
+            smemB[t/BN][t%BN]=__float2half_rn(B[(k_pos+(t/BN))*N+n_pos+(t%BN)]);
         }
+        __syncthreads();
+        // C_block y = warp_id/4 x=warp_id%4
+        // int c_tile_y = warp_id / 4;
+        // int c_tile_x = warp_id % 4;
+        //
+
+        wmma::load_matrix_sync(a_frag, &smemA[tile*c_tile_y][0], lda);
+        wmma::load_matrix_sync(b_frag, &smemB[0][tile*c_tile_x], ldb);
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        __syncthreads();
     }
+    wmma::store_matrix_sync(&C[(m_pos+c_tile_y*tile)*N+n_pos+c_tile_x*tile], c_frag, N, wmma::mem_row_major);
 }
 
 // CPU reference GEMM: C_ref = A * B
@@ -79,7 +98,7 @@ static void gemm_cpu_ref(const float* A, const float* B, float* C, int M, int N,
             float acc = 0.0f;
             const float* a_row = A + i * K;
             for (int k = 0; k < K; ++k) {
-                acc += a_row[k] * B[k * N + j];
+                acc += a_row[k]*B[k * N + j];
             }
             C[i * N + j] = acc;
         }
@@ -137,9 +156,9 @@ int main() {
     // ---------------------------
     // 3) Problem size (fixed)
     // ---------------------------
-    constexpr int M = 4096;
+    constexpr int M = 2048;
     constexpr int N = 2048;
-    constexpr int K = 1024;
+    constexpr int K = 2048;
 
     const size_t bytesA = (size_t)M * K * sizeof(float);
     const size_t bytesB = (size_t)K * N * sizeof(float);
@@ -188,7 +207,7 @@ int main() {
     // ---------------------------
     // You can choose your own tiling; this is a common baseline.
     dim3 block(256);//8 warps
-    dim3 grid((N*M+block.x-1)/block.x);
+    dim3 grid((N*M/(BN*BM)));
 
     // Warmup (optional)
     gemm_kernel<<<grid, block>>>(dA, dB, dC, M, N, K);
