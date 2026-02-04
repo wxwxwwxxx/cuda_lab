@@ -16,7 +16,9 @@ set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 
 # Debug 时打开 device 调试
 set(CMAKE_CUDA_FLAGS_DEBUG "-G -g")
-
+set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "-lineinfo -g")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-fno-omit-frame-pointer")
+set(CMAKE_C_FLAGS_RELWITHDEBINFO "-fno-omit-frame-pointer")
 # =========================
 # 查找 CUDA
 # =========================
