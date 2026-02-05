@@ -35,15 +35,24 @@ __global__ void gemm_kernel(const float* __restrict__ A,
                             int M, int N, int K) {
     // TODO: implement C = A * B
     // A: [M, K] row-major
-    // B: [K, N] row-major
+    // B: [K, N] row-major in global memory. WMMA matrix_b row_major is only
+    // supported on sm75+, otherwise we transpose B into shared and load as
+    // col_major (B stored as [N, K] in shared).
     // C: [M, N] row-major
 
     int n_block_num = N/BN;
     // int m_block_num = M/BM;
     const int lda = BK;
-    const int ldb = BN;
     __shared__ half smemA[BM][BK];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    constexpr bool kWmmaBRowMajor = true;
+    const int ldb = BN;
     __shared__ half smemB[BK][BN];
+#else
+    constexpr bool kWmmaBRowMajor = false;
+    const int ldb = BK;
+    __shared__ half smemB[BN][BK];
+#endif
     //int tid = blockDim.x*blockIdx.x+threadIdx.x;
     int warp_id = threadIdx.x / 32;
     int c_tile_y = warp_id / 4;
@@ -52,7 +61,12 @@ __global__ void gemm_kernel(const float* __restrict__ A,
     int m_pos = (blockIdx.x/n_block_num)*BM;
     int n_pos = (blockIdx.x%n_block_num)*BN;
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    using WmmaBLayout = wmma::row_major;
+#else
+    using WmmaBLayout = wmma::col_major;
+#endif
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, WmmaBLayout> b_frag;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
     wmma::fill_fragment(c_frag,0.0f);
 
@@ -74,7 +88,11 @@ __global__ void gemm_kernel(const float* __restrict__ A,
             int t = i+threadIdx.x;
             // B start pos:(k,npos)
             // B[k_pos+(threadIdx.x/BN)][n_pos+(threadIdx.x%BN)]
-            smemB[t/BN][t%BN]=__float2half_rn(B[(k_pos+(t/BN))*N+n_pos+(t%BN)]);
+            if (kWmmaBRowMajor) {
+                smemB[t/BN][t%BN]=__float2half_rn(B[(k_pos+(t/BN))*N+n_pos+(t%BN)]);
+            } else {
+                smemB[t%BN][t/BN]=__float2half_rn(B[(k_pos+(t/BN))*N+n_pos+(t%BN)]);
+            }
         }
         __syncthreads();
         // C_block y = warp_id/4 x=warp_id%4
@@ -83,7 +101,11 @@ __global__ void gemm_kernel(const float* __restrict__ A,
         //
 
         wmma::load_matrix_sync(a_frag, &smemA[tile*c_tile_y][0], lda);
-        wmma::load_matrix_sync(b_frag, &smemB[0][tile*c_tile_x], ldb);
+        if (kWmmaBRowMajor) {
+            wmma::load_matrix_sync(b_frag, &smemB[0][tile*c_tile_x], ldb);
+        } else {
+            wmma::load_matrix_sync(b_frag, &smemB[tile*c_tile_x][0], ldb);
+        }
         wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
         __syncthreads();
     }
