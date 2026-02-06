@@ -29,26 +29,28 @@ const int BK = 16;
 // ---------------------------
 // 6) Kernel signature only (no implementation)
 // ---------------------------
-__global__ void gemm_kernel(const float* __restrict__ A,
-                            const float* __restrict__ B,
+__global__ void gemm_kernel(const half* __restrict__ A,
+                            const half* __restrict__ B,
                             float* __restrict__ C,
                             int M, int N, int K) {
     // TODO: implement C = A * B
     // A: [M, K] row-major
-    // B: [K, N] row-major
+    // B: [K, N] col-major
     // C: [M, N] row-major
 
     int n_block_num = N/BN;
     // int m_block_num = M/BM;
-    const int lda = BK;
-    const int ldb = BN;
-    __shared__ half smemA[BM][BK];
-    __shared__ half smemB[BK][BN];
-    //int tid = blockDim.x*blockIdx.x+threadIdx.x;
+    constexpr int APAD=8;
+    constexpr int BPAD=8;
+    const int lda = BK+APAD;
+    const int ldb = BN+BPAD;
+    __align__(16) __shared__ half smemA[BM][BK+APAD];
+    __align__(16) __shared__ half smemB[BK][BN+BPAD];
+    // int tid = blockDim.x*blockIdx.x+threadIdx.x;
     int warp_id = threadIdx.x / 32;
     int c_tile_y = warp_id / 4;
     int c_tile_x = warp_id % 4;
-    //int lane_id = threadIdx.x % 32;
+    // int lane_id = threadIdx.x % 32;
     int m_pos = (blockIdx.x/n_block_num)*BM;
     int n_pos = (blockIdx.x%n_block_num)*BN;
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
@@ -61,20 +63,23 @@ __global__ void gemm_kernel(const float* __restrict__ A,
     {
         // thread num:256
         // move_num:A: BM*BK=32*16=512
-        for(int i=0;i<BM*BK;i+=blockDim.x) // stride = blockDim.x
+        int vec_ay=threadIdx.x/2;
+        int vec_ax=threadIdx.x%2;
+        if(vec_ay<BM)
         {
-            // A start pos:(mpos,k)
-            // A[m_pos+(threadIdx.x/BK)][k_pos+(threadIdx.x%BK)]
-            int t = i+threadIdx.x;
-            smemA[t/BK][t%BK]=__float2half_rn(A[(m_pos+(t/BK))*K+k_pos+(t%BK)]);
+            uint4 vec = *reinterpret_cast<const uint4*>(A+(m_pos+vec_ay)*K+k_pos+(vec_ax<<3));
+            uint4* smemA_vec = reinterpret_cast<uint4*>(&smemA[0][0]);
+            smemA_vec[vec_ay*(lda>>3)+vec_ax]=vec;
         }
-        // move_num:B: BN*BK=64*16=1024
-        for(int i=0;i<BN*BK;i+=blockDim.x) // stride = blockDim.x
+        // thread num:256
+        // move_num:B: BK*BN=16*64=1024
+        int vec_by=threadIdx.x/8;
+        int vec_bx=threadIdx.x%8;
+        if(vec_by<BK)
         {
-            int t = i+threadIdx.x;
-            // B start pos:(k,npos)
-            // B[k_pos+(threadIdx.x/BN)][n_pos+(threadIdx.x%BN)]
-            smemB[t/BN][t%BN]=__float2half_rn(B[(k_pos+(t/BN))*N+n_pos+(t%BN)]);
+            uint4 vec = *reinterpret_cast<const uint4*>(B+(k_pos+vec_by)*N+n_pos+(vec_bx<<3));
+            uint4* smemB_vec = reinterpret_cast<uint4*>(&smemB[0][0]);
+            smemB_vec[vec_by*(ldb>>3)+vec_bx]=vec;
         }
         __syncthreads();
         // C_block y = warp_id/4 x=warp_id%4
@@ -91,24 +96,26 @@ __global__ void gemm_kernel(const float* __restrict__ A,
 }
 
 // CPU reference GEMM: C_ref = A * B
-static void gemm_cpu_ref(const float* A, const float* B, float* C, int M, int N, int K) {
+static void gemm_cpu_ref(const half* A, const half* B, float* C, int M, int N, int K) {
     // Simple triple loop (correctness reference)
     for (int i = 0; i < M; ++i) {
         for (int j = 0; j < N; ++j) {
             float acc = 0.0f;
-            const float* a_row = A + i * K;
+            const half* a_row = A + i * K;
             for (int k = 0; k < K; ++k) {
-                acc += a_row[k]*B[k * N + j];
+                float af = __half2float(a_row[k]);
+                float bf = __half2float(B[k*N+j]);
+                acc += af*bf; //fmaf(af, bf, acc);
             }
             C[i * N + j] = acc;
         }
     }
 }
 
-static void fill_random(std::vector<float>& x, float lo = -1.0f, float hi = 1.0f, uint32_t seed = 123) {
+static void fill_random(std::vector<half>& x, float lo = -1.0f, float hi = 1.0f, uint32_t seed = 123) {
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> dist(lo, hi);
-    for (auto& v : x) v = dist(rng);
+    for (auto& v : x) v = __float2half_rn(dist(rng));
 }
 
 static void compare(const std::vector<float>& ref,
@@ -158,26 +165,26 @@ int main() {
     // ---------------------------
     constexpr int M = 2048;
     constexpr int N = 2048;
-    constexpr int K = 2048;
+    constexpr int K = 1024;
 
-    const size_t bytesA = (size_t)M * K * sizeof(float);
-    const size_t bytesB = (size_t)K * N * sizeof(float);
+    const size_t bytesA = (size_t)M * K * sizeof(half);
+    const size_t bytesB = (size_t)K * N * sizeof(half);
     const size_t bytesC = (size_t)M * N * sizeof(float);
 
     std::cout << "GEMM: C[M,N] = A[M,K] * B[K,N]\n";
-    std::cout << "M=" << M << " N=" << N << " K=" << K << " (float32)\n";
+    std::cout << "M=" << M << " N=" << N << " K=" << K << " (half)\n";
 
     // ---------------------------
     // 2) Host allocations in main
     // ---------------------------
-    std::vector<float> hA((size_t)M * K);
-    std::vector<float> hB((size_t)K * N);
+    std::vector<half> hA((size_t)M * K);
+    std::vector<half> hB((size_t)K * N);
     std::vector<float> hC((size_t)M * N, 0.0f);      // output from your kernel
     std::vector<float> hC_ref((size_t)M * N, 0.0f);  // correct answer
 
     // Random init
-    fill_random(hA, -1.0f, 1.0f, 123);
-    fill_random(hB, -1.0f, 1.0f, 456);
+    fill_random(hA, -1.0f, 1.0f, 49);
+    fill_random(hB, -1.0f, 1.0f, 59);
 
     // ---------------------------
     // 5) CPU reference in main
@@ -193,7 +200,8 @@ int main() {
     // ---------------------------
     // 4) Move to GPU in main
     // ---------------------------
-    float *dA = nullptr, *dB = nullptr, *dC = nullptr;
+    half *dA = nullptr, *dB = nullptr;
+    float *dC = nullptr;
     CUDA_CHECK(cudaMalloc(&dA, bytesA));
     CUDA_CHECK(cudaMalloc(&dB, bytesB));
     CUDA_CHECK(cudaMalloc(&dC, bytesC));
