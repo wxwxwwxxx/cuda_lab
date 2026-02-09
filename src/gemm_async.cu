@@ -1,5 +1,4 @@
 #include <cuda_runtime.h>
-#include <cuda/barrier> // 必须保留，这是 libcu++ 的核心
 
 #include <cstdio>
 #include <cstdlib>
@@ -45,14 +44,12 @@ __global__ void gemm_kernel(const half* __restrict__ A,
     constexpr int BPAD=8;
     const int lda = BK+APAD;
     const int ldb = BN+BPAD;
-    __shared__ cuda::barrier<cuda::thread_scope_block> bar;
-    __align__(16) __shared__ half smemA[2][BM][BK+APAD];
-    __align__(16) __shared__ half smemB[2][BK][BN+BPAD];
+    __align__(16) __shared__ half smemA[BM][BK+APAD];
+    __align__(16) __shared__ half smemB[BK][BN+BPAD];
     // int tid = blockDim.x*blockIdx.x+threadIdx.x;
     int warp_id = threadIdx.x / 32;
     int c_tile_y = warp_id / 4;
     int c_tile_x = warp_id % 4;
-    int smem_pointer = 0;
     // int lane_id = threadIdx.x % 32;
     int m_pos = (blockIdx.x/n_block_num)*BM;
     int n_pos = (blockIdx.x%n_block_num)*BN;
@@ -60,10 +57,7 @@ __global__ void gemm_kernel(const half* __restrict__ A,
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
     wmma::fill_fragment(c_frag,0.0f);
-    if (threadIdx.x == 0) {
-        init(&bar, blockDim.x);
-    }
-    __syncthreads();
+
     // move to smem
     for(int k_pos=0;k_pos<K;k_pos+=BK)
     {
@@ -73,11 +67,9 @@ __global__ void gemm_kernel(const half* __restrict__ A,
         int vec_ax=threadIdx.x%2;
         if(vec_ay<BM)
         {
-            uint4* smemA_vec = reinterpret_cast<uint4*>(&smemA[smem_pointer][0][0]);
-            cuda::memcpy_async(&smemA_vec[vec_ay*(lda>>3)+vec_ax],reinterpret_cast<const uint4*>(A+(m_pos+vec_ay)*K+k_pos+(vec_ax<<3)),sizeof(uint4),bar);
-//            uint4 vec = *reinterpret_cast<const uint4*>(A+(m_pos+vec_ay)*K+k_pos+(vec_ax<<3));
-//            uint4* smemA_vec = reinterpret_cast<uint4*>(&smemA[0][0]);
-//            smemA_vec[vec_ay*(lda>>3)+vec_ax]=vec;
+            uint4 vec = *reinterpret_cast<const uint4*>(A+(m_pos+vec_ay)*K+k_pos+(vec_ax<<3));
+            uint4* smemA_vec = reinterpret_cast<uint4*>(&smemA[0][0]);
+            smemA_vec[vec_ay*(lda>>3)+vec_ax]=vec;
         }
         // thread num:256
         // move_num:B: BK*BN=16*64=1024
