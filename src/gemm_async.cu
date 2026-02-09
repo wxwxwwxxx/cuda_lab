@@ -38,8 +38,12 @@ __global__ void gemm_kernel(const half* __restrict__ A,
                             int M, int N, int K) {
     // TODO: implement C = A * B
     // A: [M, K] row-major
-    // B: [K, N] col-major
+    // B: [K, N] row-major
     // C: [M, N] row-major
+    const half* __restrict__ A_
+      = (const half*)__builtin_assume_aligned(A, 16);
+    const half* __restrict__ B_
+      = (const half*)__builtin_assume_aligned(B, 16);
 
     int n_block_num = N/BN;
     // int m_block_num = M/BM;
@@ -48,8 +52,21 @@ __global__ void gemm_kernel(const half* __restrict__ A,
     const int lda = BK+APAD;
     const int ldb = BN+BPAD;
     // __shared__ cuda::barrier<cuda::thread_scope_block> bar;
-    __shared__ barrier_t bar_copy[2];
-    __shared__ barrier_t bar_consume[2];
+    // -----------------------------------------------------------
+    // [修改 1]：不要直接声明对象，而是声明对齐的裸内存
+    // -----------------------------------------------------------
+    // barrier_t 的大小和对齐要求
+    __shared__ alignas(barrier_t) char smem_bar_copy_raw[2 * sizeof(barrier_t)];
+    __shared__ alignas(barrier_t) char smem_bar_consume_raw[2 * sizeof(barrier_t)];
+
+    // 将裸内存强转为对象指针
+    barrier_t* bar_copy    = reinterpret_cast<barrier_t*>(smem_bar_copy_raw);
+    barrier_t* bar_consume = reinterpret_cast<barrier_t*>(smem_bar_consume_raw);
+
+    // -----------------------------------------------------------
+    // [修改 2]：使用 Placement New 手动构造
+    // -----------------------------------------------------------
+
     __align__(16) __shared__ half smemA[2][BM][BK+APAD];
     __align__(16) __shared__ half smemB[2][BK][BN+BPAD];
     // int tid = blockDim.x*blockIdx.x+threadIdx.x;
@@ -65,10 +82,12 @@ __global__ void gemm_kernel(const half* __restrict__ A,
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
     wmma::fill_fragment(c_frag,0.0f);
     if (threadIdx.x == 0) {
-        init(&bar_copy[0],    blockDim.x);
-        init(&bar_copy[1],    blockDim.x);
-        init(&bar_consume[0], blockDim.x);
-        init(&bar_consume[1], blockDim.x);
+        // 这里的语法是：new (地址) 类型(参数);
+        // 这会在指定的内存地址上调用构造函数，而不分配新内存
+        new (&bar_copy[0])    barrier_t(blockDim.x);
+        new (&bar_copy[1])    barrier_t(blockDim.x);
+        new (&bar_consume[0]) barrier_t(blockDim.x);
+        new (&bar_consume[1]) barrier_t(blockDim.x);
     }
     __syncthreads();
     // move to smem
@@ -84,14 +103,14 @@ __global__ void gemm_kernel(const half* __restrict__ A,
                 int vec_ay=t/2;
                 int vec_ax=t%2;
                 uint4* smemA_vec = reinterpret_cast<uint4*>(&smemA[cur_buf][0][0]);
-                cuda::memcpy_async(&smemA_vec[vec_ay*(lda>>3)+vec_ax],reinterpret_cast<const uint4*>(A+(m_pos+vec_ay)*K+k_pos+(vec_ax<<3)),sizeof(uint4),bar_copy[cur_buf]);
+                cuda::memcpy_async(&smemA_vec[vec_ay*(lda>>3)+vec_ax],reinterpret_cast<const uint4*>(A_+(m_pos+vec_ay)*K+k_pos+(vec_ax<<3)),sizeof(uint4),bar_copy[cur_buf]);
             }
             else if (t<192) {
                 int local_t=t-64;
                 int vec_by=local_t/8;
                 int vec_bx=local_t%8;
                 uint4* smemB_vec = reinterpret_cast<uint4*>(&smemB[cur_buf][0][0]);
-                cuda::memcpy_async(&smemB_vec[vec_by*(ldb>>3)+vec_bx],reinterpret_cast<const uint4*>(B+(k_pos+vec_by)*N+n_pos+(vec_bx<<3)),sizeof(uint4),bar_copy[cur_buf]);
+                cuda::memcpy_async(&smemB_vec[vec_by*(ldb>>3)+vec_bx],reinterpret_cast<const uint4*>(B_+(k_pos+vec_by)*N+n_pos+(vec_bx<<3)),sizeof(uint4),bar_copy[cur_buf]);
             }
             tok_copy[cur_buf]=bar_copy[cur_buf].arrive();
         }
