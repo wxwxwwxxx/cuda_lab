@@ -45,14 +45,14 @@ __global__ void gemm_kernel(const half* __restrict__ A,
     constexpr int BPAD=8;
     const int lda = BK+APAD;
     const int ldb = BN+BPAD;
-    __shared__ cuda::barrier<cuda::thread_scope_block> bar;
-    __align__(16) __shared__ half smemA[2][BM][BK+APAD];
-    __align__(16) __shared__ half smemB[2][BK][BN+BPAD];
+
+    __align__(16) __shared__ half smemA[BM][BK+APAD];
+    __align__(16) __shared__ half smemB[BK][BN+BPAD];
     // int tid = blockDim.x*blockIdx.x+threadIdx.x;
     int warp_id = threadIdx.x / 32;
     int c_tile_y = warp_id / 4;
     int c_tile_x = warp_id % 4;
-    int smem_pointer = 0;
+
     // int lane_id = threadIdx.x % 32;
     int m_pos = (blockIdx.x/n_block_num)*BM;
     int n_pos = (blockIdx.x%n_block_num)*BN;
@@ -60,41 +60,32 @@ __global__ void gemm_kernel(const half* __restrict__ A,
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
     wmma::fill_fragment(c_frag,0.0f);
-    if (threadIdx.x == 0) {
-        init(&bar, blockDim.x);
-    }
-    __syncthreads();
     // move to smem
     for(int k_pos=0;k_pos<K;k_pos+=BK)
     {
         // thread num:256
         // move_num:A: BM*BK=32*16=512
-        int vec_ay=threadIdx.x/2;
-        int vec_ax=threadIdx.x%2;
-        if(vec_ay<BM)
-        {
-            uint4* smemA_vec = reinterpret_cast<uint4*>(&smemA[smem_pointer][0][0]);
-            cuda::memcpy_async(&smemA_vec[vec_ay*(lda>>3)+vec_ax],reinterpret_cast<const uint4*>(A+(m_pos+vec_ay)*K+k_pos+(vec_ax<<3)),sizeof(uint4),bar);
-//            uint4 vec = *reinterpret_cast<const uint4*>(A+(m_pos+vec_ay)*K+k_pos+(vec_ax<<3));
-//            uint4* smemA_vec = reinterpret_cast<uint4*>(&smemA[0][0]);
-//            smemA_vec[vec_ay*(lda>>3)+vec_ax]=vec;
+        int t = threadIdx.x;
+        if (t<64) {
+            int vec_ay=t/2;
+            int vec_ax=t%2;
+            uint4 vec = *reinterpret_cast<const uint4*>(A+(m_pos+vec_ay)*K+k_pos+(vec_ax<<3));
+            uint4* smemA_vec = reinterpret_cast<uint4*>(&smemA[0][0]);
+            smemA_vec[vec_ay*(lda>>3)+vec_ax]=vec;
+
         }
-        // thread num:256
-        // move_num:B: BK*BN=16*64=1024
-        int vec_by=threadIdx.x/8;
-        int vec_bx=threadIdx.x%8;
-        if(vec_by<BK)
-        {
+        else if (t<192) {
+            t-=64;
+            int vec_by=t/8;
+            int vec_bx=t%8;
             uint4 vec = *reinterpret_cast<const uint4*>(B+(k_pos+vec_by)*N+n_pos+(vec_bx<<3));
             uint4* smemB_vec = reinterpret_cast<uint4*>(&smemB[0][0]);
             smemB_vec[vec_by*(ldb>>3)+vec_bx]=vec;
         }
-        __syncthreads();
-        // C_block y = warp_id/4 x=warp_id%4
-        // int c_tile_y = warp_id / 4;
-        // int c_tile_x = warp_id % 4;
-        //
+        // thread num:256
+        // move_num:B: BK*BN=16*64=1024
 
+        __syncthreads();
         wmma::load_matrix_sync(a_frag, &smemA[tile*c_tile_y][0], lda);
         wmma::load_matrix_sync(b_frag, &smemB[0][tile*c_tile_x], ldb);
         wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
