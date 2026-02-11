@@ -29,8 +29,8 @@ constexpr int tile = 16;
 constexpr int BM = tile * 2; // 32
 constexpr int BN = tile * 4; // 64。8 warp, allocated as 4*2
 constexpr int BK = 32;
-constexpr int APAD=8;
-constexpr int BPAD=8;
+constexpr int APAD = 8;
+constexpr int BPAD = 8;
 constexpr int lda = BK+APAD;
 constexpr int ldb = BN+BPAD;
 constexpr int lda_vec = BK>>3; //8 half at once
@@ -48,10 +48,10 @@ __global__ void gemm_kernel(const half* __restrict__ A,
     // A: [M, K] row-major
     // B: [K, N] row-major
     // C: [M, N] row-major
-    const half* __restrict__ A_
-      = (const half*)__builtin_assume_aligned(A, 16);
-    const half* __restrict__ B_
-      = (const half*)__builtin_assume_aligned(B, 16);
+    const half* __restrict__ A_ = (const half*)__builtin_assume_aligned(A, 16);
+    const half* __restrict__ B_ = (const half*)__builtin_assume_aligned(B, 16);
+    const uint4* A4 = reinterpret_cast<const uint4*>(A_);
+    const uint4* B4 = reinterpret_cast<const uint4*>(B_);
 
     int n_block_num = N/BN;
     // int m_block_num = M/BM;
@@ -80,11 +80,11 @@ __global__ void gemm_kernel(const half* __restrict__ A,
     __align__(16) __shared__ half smemA[2][BM][BK+APAD];
     __align__(16) __shared__ half smemB[2][BK][BN+BPAD];
     // int tid = blockDim.x*blockIdx.x+threadIdx.x;
-    int warp_id = threadIdx.x / 32;
-    int c_tile_y = warp_id / 4;
-    int c_tile_x = warp_id % 4;
-    int cur_buf=0,next_buf=1;
-    // int lane_id = threadIdx.x % 32;
+    int warp_id = threadIdx.x >> 5;
+    int lane_id = threadIdx.x & 31;
+    int c_tile_y = warp_id >> 2;
+    int c_tile_x = warp_id & 3;
+    int cur_buf=0, next_buf=1;
     int m_pos = (blockIdx.x/n_block_num)*BM;
     int n_pos = (blockIdx.x%n_block_num)*BN;
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
@@ -98,13 +98,13 @@ __global__ void gemm_kernel(const half* __restrict__ A,
     tok_done[next_buf] = bar_consume[next_buf].arrive();
     auto move_data = [&](int k_pos,int buf){
         // move A
+        // BK and BN must be less than 256 (lane num*8)
         uint4* smemA_vec = reinterpret_cast<uint4*>(&smemA[buf][0][0]);
         for(int t=threadIdx.x;t<((BM*BK)>>3);t+=blockDim.x)
         {
-
             int vec_ay=t/lda_vec;
             int vec_ax=t%lda_vec;
-            cuda::memcpy_async(&smemA_vec[vec_ay*(lda>>3)+vec_ax],reinterpret_cast<const uint4*>(A_+(m_pos+vec_ay)*K+k_pos+(vec_ax<<3)),sizeof(uint4),bar_copy[buf]);
+            cuda::memcpy_async(smemA_vec+vec_ay*(lda>>3)+vec_ax,A4 + (m_pos+vec_ay)*(K>>3) + (k_pos>>3) + vec_ax,sizeof(uint4),bar_copy[buf]);
         }
         // move B
         uint4* smemB_vec = reinterpret_cast<uint4*>(&smemB[buf][0][0]);
@@ -112,7 +112,7 @@ __global__ void gemm_kernel(const half* __restrict__ A,
         {
             int vec_by=t/ldb_vec;
             int vec_bx=t%ldb_vec;
-            cuda::memcpy_async(&smemB_vec[vec_by*(ldb>>3)+vec_bx],reinterpret_cast<const uint4*>(B_+(k_pos+vec_by)*N+n_pos+(vec_bx<<3)),sizeof(uint4),bar_copy[buf]);
+            cuda::memcpy_async(smemB_vec+vec_by*(ldb>>3)+vec_bx,B4 + (k_pos+vec_by)*(N>>3) + (n_pos>>3) + vec_bx,sizeof(uint4),bar_copy[buf]);
         }
     };
     move_data(0,cur_buf);
