@@ -48,8 +48,8 @@ __global__ void gemm_kernel(const half* __restrict__ A,
     // A: [M, K] row-major
     // B: [K, N] row-major
     // C: [M, N] row-major
-    const half* __restrict__ A_ = (const half*)__builtin_assume_aligned(A, 16);
-    const half* __restrict__ B_ = (const half*)__builtin_assume_aligned(B, 16);
+    const half* __restrict__ A_ = (const half*)__builtin_assume_aligned(A, 32);
+    const half* __restrict__ B_ = (const half*)__builtin_assume_aligned(B, 32);
     const uint4* A4 = reinterpret_cast<const uint4*>(A_);
     const uint4* B4 = reinterpret_cast<const uint4*>(B_);
 
@@ -77,8 +77,8 @@ __global__ void gemm_kernel(const half* __restrict__ A,
     }
     __syncthreads();
 
-    __align__(16) __shared__ half smemA[2][BM][BK+APAD];
-    __align__(16) __shared__ half smemB[2][BK][BN+BPAD];
+    __align__(32) __shared__ half smemA[2][BM][BK+APAD];
+    __align__(32) __shared__ half smemB[2][BK][BN+BPAD];
     // int tid = blockDim.x*blockIdx.x+threadIdx.x;
     int warp_id = threadIdx.x >> 5;
     int lane_id = threadIdx.x & 31;
@@ -131,13 +131,16 @@ __global__ void gemm_kernel(const half* __restrict__ A,
         }
         bar_copy[cur_buf].wait(std::move(tok_copy[cur_buf]));
         // warp id as y, tiled n as x
-        for(int n_step=0;n_step<8;++n_step)
-            for(int k_step=0;k_step<BK;k_step+=16)
+
+        for(int k_step=0;k_step<BK;k_step+=16){
+            wmma::load_matrix_sync(a_frag, &smemA[cur_buf][tile*warp_id][k_step], lda);
+            for(int n_step=0;n_step<8;++n_step)
             {
-                wmma::load_matrix_sync(a_frag, &smemA[cur_buf][tile*warp_id][k_step], lda);
                 wmma::load_matrix_sync(b_frag, &smemB[cur_buf][k_step][tile*n_step], ldb);
                 wmma::mma_sync(c_frag[n_step], a_frag, b_frag, c_frag[n_step]);
             }
+        }
+
         tok_done[cur_buf]=bar_consume[cur_buf].arrive();
         cur_buf ^= 1;
         next_buf ^= 1;
@@ -215,9 +218,9 @@ int main() {
     // ---------------------------
     // 3) Problem size (fixed)
     // ---------------------------
-    constexpr int M = 2048;
-    constexpr int N = 2048;
-    constexpr int K = 1024;
+    constexpr int M = 4096;
+    constexpr int N = 4096;
+    constexpr int K = 4096;
 
     const size_t bytesA = (size_t)M * K * sizeof(half);
     const size_t bytesB = (size_t)K * N * sizeof(half);
@@ -243,7 +246,7 @@ int main() {
     // ---------------------------
     {
         auto t0 = std::chrono::high_resolution_clock::now();
-        gemm_cpu_ref(hA.data(), hB.data(), hC_ref.data(), M, N, K);
+        // gemm_cpu_ref(hA.data(), hB.data(), hC_ref.data(), M, N, K);
         auto t1 = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         std::cout << "CPU reference time: " << ms << " ms\n";
