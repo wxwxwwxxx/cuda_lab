@@ -61,24 +61,24 @@ __global__ void gemm_kernel(const half* __restrict__ A,
     // [修改 1]：不要直接声明对象，而是声明对齐的裸内存
     // -----------------------------------------------------------
     // barrier_t 的大小和对齐要求
-            __shared__ alignas(barrier_t) char smem_bar_copy_raw[2 * sizeof(barrier_t)];
-            __shared__ alignas(barrier_t) char smem_bar_consume_raw[2 * sizeof(barrier_t)];
+            // __shared__ alignas(barrier_t) char smem_bar_copy_raw[2 * sizeof(barrier_t)];
+            // __shared__ alignas(barrier_t) char smem_bar_consume_raw[2 * sizeof(barrier_t)];
 
     // 将裸内存强转为对象指针
-    barrier_t* bar_copy    = reinterpret_cast<barrier_t*>(smem_bar_copy_raw);
-    barrier_t* bar_consume = reinterpret_cast<barrier_t*>(smem_bar_consume_raw);
+    __shared__ barrier_t bar_copy[2];
+    __shared__ barrier_t bar_consume[2];
     if (threadIdx.x == 0) {
         // 这里的语法是：new (地址) 类型(参数);
         // 这会在指定的内存地址上调用构造函数，而不分配新内存
-        new (&bar_copy[0])    barrier_t(blockDim.x);
-        new (&bar_copy[1])    barrier_t(blockDim.x);
-        new (&bar_consume[0]) barrier_t(blockDim.x);
-        new (&bar_consume[1]) barrier_t(blockDim.x);
+        init(&bar_copy[0],blockDim.x);
+        init(&bar_copy[1],blockDim.x);
+        init(&bar_consume[0],blockDim.x);
+        init(&bar_consume[1],blockDim.x);
     }
     __syncthreads();
 
-    __align__(32) __shared__ half smemA[2][BM][BK+APAD];
-    __align__(32) __shared__ half smemB[2][BK][BN+BPAD];
+    __shared__ alignas(16) half smemA[2][BM][BK+APAD];
+    __shared__ alignas(16) half smemB[2][BK][BN+BPAD];
     // int tid = blockDim.x*blockIdx.x+threadIdx.x;
     int warp_id = threadIdx.x >> 5;
     int lane_id = threadIdx.x & 31;
@@ -109,7 +109,7 @@ __global__ void gemm_kernel(const half* __restrict__ A,
         {
             int vec_ay=t/lda_vec;
             int vec_ax=t%lda_vec;
-            cuda::memcpy_async(smemA_vec+vec_ay*(lda>>3)+vec_ax,A4 + (m_pos+vec_ay)*(K>>3) + (k_pos>>3) + vec_ax,sizeof(uint4),bar_copy[buf]);
+            cuda::memcpy_async(smemA_vec+vec_ay*(lda>>3)+vec_ax,A4 + (m_pos+vec_ay)*(K>>3) + (k_pos>>3) + vec_ax,cuda::aligned_size_t<16>(sizeof(uint4)),bar_copy[buf]);
         }
         // move B
         uint4* smemB_vec = reinterpret_cast<uint4*>(&smemB[buf][0][0]);
@@ -117,7 +117,7 @@ __global__ void gemm_kernel(const half* __restrict__ A,
         {
             int vec_by=t/ldb_vec;
             int vec_bx=t%ldb_vec;
-            cuda::memcpy_async(smemB_vec+vec_by*(ldb>>3)+vec_bx,B4 + (k_pos+vec_by)*(N>>3) + (n_pos>>3) + vec_bx,sizeof(uint4),bar_copy[buf]);
+            cuda::memcpy_async(smemB_vec+vec_by*(ldb>>3)+vec_bx,B4 + (k_pos+vec_by)*(N>>3) + (n_pos>>3) + vec_bx,cuda::aligned_size_t<16>(sizeof(uint4)),bar_copy[buf]);
         }
     };
     move_data(0,cur_buf);
@@ -130,8 +130,8 @@ __global__ void gemm_kernel(const half* __restrict__ A,
             tok_copy[next_buf]=bar_copy[next_buf].arrive();
         }
         bar_copy[cur_buf].wait(std::move(tok_copy[cur_buf]));
-        // warp id as y, tiled n as x
 
+        // warp id as y, tiled n as x
         for(int k_step=0;k_step<BK;k_step+=16){
             wmma::load_matrix_sync(a_frag, &smemA[cur_buf][tile*warp_id][k_step], lda);
             for(int n_step=0;n_step<8;++n_step)

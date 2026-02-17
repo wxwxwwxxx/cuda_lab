@@ -1,5 +1,8 @@
 #include <cuda_runtime.h>
-#include <cuda/barrier> // 必须保留，这是 libcu++ 的核心
+//#include <cuda/barrier> // 必须保留，这是 libcu++ 的核心
+#include <cuda/pipeline> // 必须保留，这是 libcu++ 的核心
+#include <cooperative_groups.h>
+
 
 #include <cstdio>
 #include <cstdlib>
@@ -12,9 +15,7 @@
 #include <mma.h>
 
 using namespace nvcuda;
-using barrier_t = cuda::barrier<cuda::thread_scope_block>;
-using token_t   = barrier_t::arrival_token;
-
+namespace cg = cooperative_groups;
 #define CUDA_CHECK(call)                                                          \
   do {                                                                            \
     cudaError_t _e = (call);                                                      \
@@ -26,8 +27,8 @@ using token_t   = barrier_t::arrival_token;
   } while (0)
 
 constexpr int tile = 16;
-constexpr int BM = tile * 2; // 32
-constexpr int BN = tile * 4; // 64。8 warp, allocated as 4*2
+constexpr int BM = tile * 8; // 256
+constexpr int BN = tile * 8; // 256
 constexpr int BK = 32;
 constexpr int APAD = 8;
 constexpr int BPAD = 8;
@@ -48,54 +49,35 @@ __global__ void gemm_kernel(const half* __restrict__ A,
     // A: [M, K] row-major
     // B: [K, N] row-major
     // C: [M, N] row-major
-    const half* __restrict__ A_ = (const half*)__builtin_assume_aligned(A, 16);
-    const half* __restrict__ B_ = (const half*)__builtin_assume_aligned(B, 16);
+    const half* __restrict__ A_ = (const half*)__builtin_assume_aligned(A, 32);
+    const half* __restrict__ B_ = (const half*)__builtin_assume_aligned(B, 32);
     const uint4* A4 = reinterpret_cast<const uint4*>(A_);
     const uint4* B4 = reinterpret_cast<const uint4*>(B_);
-
+    __shared__ cuda::pipeline_shared_state<cuda::thread_scope_block, 2> pstate;
+    cg::thread_block cta = cg::this_thread_block();
+    auto pipe = cuda::make_pipeline(cta, &pstate);
+    //auto pipe = cuda::make_pipeline();
     int n_block_num = N/BN;
     // int m_block_num = M/BM;
-
-    // __shared__ cuda::barrier<cuda::thread_scope_block> bar;
-    // -----------------------------------------------------------
-    // [修改 1]：不要直接声明对象，而是声明对齐的裸内存
-    // -----------------------------------------------------------
-    // barrier_t 的大小和对齐要求
-    __shared__ alignas(barrier_t) char smem_bar_copy_raw[2 * sizeof(barrier_t)];
-    __shared__ alignas(barrier_t) char smem_bar_consume_raw[2 * sizeof(barrier_t)];
-
-    // 将裸内存强转为对象指针
-    barrier_t* bar_copy    = reinterpret_cast<barrier_t*>(smem_bar_copy_raw);
-    barrier_t* bar_consume = reinterpret_cast<barrier_t*>(smem_bar_consume_raw);
-    if (threadIdx.x == 0) {
-        // 这里的语法是：new (地址) 类型(参数);
-        // 这会在指定的内存地址上调用构造函数，而不分配新内存
-        new (&bar_copy[0])    barrier_t(blockDim.x);
-        new (&bar_copy[1])    barrier_t(blockDim.x);
-        new (&bar_consume[0]) barrier_t(blockDim.x);
-        new (&bar_consume[1]) barrier_t(blockDim.x);
-    }
-    __syncthreads();
-
-    __align__(16) __shared__ half smemA[2][BM][BK+APAD];
-    __align__(16) __shared__ half smemB[2][BK][BN+BPAD];
+    __shared__ alignas(16) half smemA[2][BM][BK+APAD];
+    __shared__ alignas(16) half smemB[2][BK][BN+BPAD];
     // int tid = blockDim.x*blockIdx.x+threadIdx.x;
     int warp_id = threadIdx.x >> 5;
     int lane_id = threadIdx.x & 31;
-    int c_tile_y = warp_id >> 2;
-    int c_tile_x = warp_id & 3;
+//    int c_tile_y = warp_id >> 2;
+//    int c_tile_x = warp_id & 3;
     int cur_buf=0, next_buf=1;
     int m_pos = (blockIdx.x/n_block_num)*BM;
     int n_pos = (blockIdx.x%n_block_num)*BN;
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
-    wmma::fill_fragment(c_frag,0.0f);
-
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag[8];
+    #pragma unroll
+    for(int i=0;i<8;i++)
+    {
+        wmma::fill_fragment(c_frag[i],0.0f);
+    }
     // move to smem
-    token_t tok_copy[2];
-    token_t tok_done[2];
-    tok_done[next_buf] = bar_consume[next_buf].arrive();
     auto move_data = [&](int k_pos,int buf){
         // move A
         // BK and BN must be less than 256 (lane num*8)
@@ -104,7 +86,7 @@ __global__ void gemm_kernel(const half* __restrict__ A,
         {
             int vec_ay=t/lda_vec;
             int vec_ax=t%lda_vec;
-            cuda::memcpy_async(smemA_vec+vec_ay*(lda>>3)+vec_ax,A4 + (m_pos+vec_ay)*(K>>3) + (k_pos>>3) + vec_ax,sizeof(uint4),bar_copy[buf]);
+            cuda::memcpy_async(smemA_vec+vec_ay*(lda>>3)+vec_ax,A4 + (m_pos+vec_ay)*(K>>3) + (k_pos>>3) + vec_ax,cuda::aligned_size_t<16>(sizeof(uint4)),pipe);
         }
         // move B
         uint4* smemB_vec = reinterpret_cast<uint4*>(&smemB[buf][0][0]);
@@ -112,30 +94,36 @@ __global__ void gemm_kernel(const half* __restrict__ A,
         {
             int vec_by=t/ldb_vec;
             int vec_bx=t%ldb_vec;
-            cuda::memcpy_async(smemB_vec+vec_by*(ldb>>3)+vec_bx,B4 + (k_pos+vec_by)*(N>>3) + (n_pos>>3) + vec_bx,sizeof(uint4),bar_copy[buf]);
+            cuda::memcpy_async(smemB_vec+vec_by*(ldb>>3)+vec_bx,B4 + (k_pos+vec_by)*(N>>3) + (n_pos>>3) + vec_bx,cuda::aligned_size_t<16>(sizeof(uint4)),pipe);
         }
     };
+    pipe.producer_acquire();
     move_data(0,cur_buf);
-    tok_copy[cur_buf]=bar_copy[cur_buf].arrive();
+    pipe.producer_commit();
     for(int k_pos=0;k_pos<K;k_pos+=BK)
     {
+        pipe.consumer_wait();
+        // warp id as y, tiled n as x
+        for(int k_step=0;k_step<BK;k_step+=16){
+            wmma::load_matrix_sync(a_frag, &smemA[cur_buf][tile*warp_id][k_step], lda);
+            for(int n_step=0;n_step<8;++n_step)
+            {
+                wmma::load_matrix_sync(b_frag, &smemB[cur_buf][k_step][tile*n_step], ldb);
+                wmma::mma_sync(c_frag[n_step], a_frag, b_frag, c_frag[n_step]);
+            }
+        }
+        pipe.consumer_release();
         if (k_pos+BK<K) {
-            bar_consume[next_buf].wait(std::move(tok_done[next_buf]));
+            pipe.producer_acquire();
             move_data(k_pos+BK,next_buf);
-            tok_copy[next_buf]=bar_copy[next_buf].arrive();
+            pipe.producer_commit();
         }
-        bar_copy[cur_buf].wait(std::move(tok_copy[cur_buf]));
-        for(int k_step=0;k_step<BK;k_step+=16)
-        {
-            wmma::load_matrix_sync(a_frag, &smemA[cur_buf][tile*c_tile_y][k_step], lda);
-            wmma::load_matrix_sync(b_frag, &smemB[cur_buf][k_step][tile*c_tile_x], ldb);
-            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-        }
-        tok_done[cur_buf]=bar_consume[cur_buf].arrive();
         cur_buf ^= 1;
         next_buf ^= 1;
     }
-    wmma::store_matrix_sync(&C[(m_pos+c_tile_y*tile)*N+n_pos+c_tile_x*tile], c_frag, N, wmma::mem_row_major);
+    #pragma unroll
+    for(int n=0;n<8;n++)
+        wmma::store_matrix_sync(&C[(m_pos+warp_id*tile)*N+n_pos+n*tile], c_frag[n], N, wmma::mem_row_major);
 }
 
 // CPU reference GEMM: C_ref = A * B
@@ -206,9 +194,9 @@ int main() {
     // ---------------------------
     // 3) Problem size (fixed)
     // ---------------------------
-    constexpr int M = 2048;
-    constexpr int N = 2048;
-    constexpr int K = 1024;
+    constexpr int M = 4096;
+    constexpr int N = 4096;
+    constexpr int K = 4096;
 
     const size_t bytesA = (size_t)M * K * sizeof(half);
     const size_t bytesB = (size_t)K * N * sizeof(half);
@@ -234,7 +222,7 @@ int main() {
     // ---------------------------
     {
         auto t0 = std::chrono::high_resolution_clock::now();
-        gemm_cpu_ref(hA.data(), hB.data(), hC_ref.data(), M, N, K);
+        // gemm_cpu_ref(hA.data(), hB.data(), hC_ref.data(), M, N, K);
         auto t1 = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         std::cout << "CPU reference time: " << ms << " ms\n";
@@ -270,13 +258,15 @@ int main() {
     CUDA_CHECK(cudaEventCreate(&stop));
 
     CUDA_CHECK(cudaEventRecord(start));
-    gemm_kernel<<<grid, block>>>(dA, dB, dC, M, N, K);
+    for (int i = 0; i < 100000; i++)
+        gemm_kernel<<<grid, block>>>(dA, dB, dC, M, N, K);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
 
     float kernel_ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&kernel_ms, start, stop));
+    kernel_ms = kernel_ms / 100000.0f;
     std::cout << "Kernel time (1 run): " << kernel_ms << " ms\n";
 
     // (Optional) compute achieved GFLOPs

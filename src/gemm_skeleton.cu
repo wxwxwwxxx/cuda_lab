@@ -162,9 +162,9 @@ int main() {
     // ---------------------------
     // 3) Problem size (fixed)
     // ---------------------------
-    constexpr int M = 2048;
-    constexpr int N = 2048;
-    constexpr int K = 1024;
+    constexpr int M = 4096;
+    constexpr int N = 4096;
+    constexpr int K = 4096;
 
     const size_t bytesA = (size_t)M * K * sizeof(half);
     const size_t bytesB = (size_t)K * N * sizeof(half);
@@ -190,7 +190,7 @@ int main() {
     // ---------------------------
     {
         auto t0 = std::chrono::high_resolution_clock::now();
-        gemm_cpu_ref(hA.data(), hB.data(), hC_ref.data(), M, N, K);
+        // gemm_cpu_ref(hA.data(), hB.data(), hC_ref.data(), M, N, K);
         auto t1 = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         std::cout << "CPU reference time: " << ms << " ms\n";
