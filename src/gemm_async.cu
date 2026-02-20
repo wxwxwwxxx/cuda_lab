@@ -103,6 +103,11 @@ __global__ void gemm_kernel(const half* __restrict__ A,
     for(int k_pos=0;k_pos<K;k_pos+=BK)
     {
         pipe.consumer_wait();
+        if (k_pos+BK<K) {
+            pipe.producer_acquire();
+            move_data(k_pos+BK,next_buf);
+            pipe.producer_commit();
+        }
         // warp id as y, tiled n as x
         for(int k_step=0;k_step<BK;k_step+=16){
             wmma::load_matrix_sync(a_frag, &smemA[cur_buf][tile*warp_id][k_step], lda);
@@ -113,11 +118,7 @@ __global__ void gemm_kernel(const half* __restrict__ A,
             }
         }
         pipe.consumer_release();
-        if (k_pos+BK<K) {
-            pipe.producer_acquire();
-            move_data(k_pos+BK,next_buf);
-            pipe.producer_commit();
-        }
+
         cur_buf ^= 1;
         next_buf ^= 1;
     }
@@ -258,15 +259,14 @@ int main() {
     CUDA_CHECK(cudaEventCreate(&stop));
 
     CUDA_CHECK(cudaEventRecord(start));
-    for (int i = 0; i < 100000; i++)
-        gemm_kernel<<<grid, block>>>(dA, dB, dC, M, N, K);
+
+    gemm_kernel<<<grid, block>>>(dA, dB, dC, M, N, K);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
 
     float kernel_ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&kernel_ms, start, stop));
-    kernel_ms = kernel_ms / 100000.0f;
     std::cout << "Kernel time (1 run): " << kernel_ms << " ms\n";
 
     // (Optional) compute achieved GFLOPs
