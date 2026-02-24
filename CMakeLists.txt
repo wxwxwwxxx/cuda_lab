@@ -24,12 +24,25 @@ set(CMAKE_C_FLAGS_RELWITHDEBINFO "-fno-omit-frame-pointer")
 # =========================
 find_package(CUDAToolkit REQUIRED)
 
+
+set(CUTLASS_DIR ${PROJECT_SOURCE_DIR}/thirdparty/cutlass)
+set(CUTLASS_AVAILABLE OFF)
+if (EXISTS ${CUTLASS_DIR}/include/cutlass/cutlass.h)
+    set(CUTLASS_AVAILABLE ON)
+endif()
+
+
 # =========================
 # 搜索所有 cu 文件
 # =========================
 file(GLOB CUDA_SOURCES
         ${PROJECT_SOURCE_DIR}/src/*.cu
 )
+
+if (NOT CUTLASS_AVAILABLE)
+    list(REMOVE_ITEM CUDA_SOURCES ${PROJECT_SOURCE_DIR}/src/gemm_cutlass.cu)
+    message(STATUS "CUTLASS not found at ${CUTLASS_DIR}; run: git submodule update --init --recursive")
+endif()
 
 # =========================
 # 为每个 cu 生成一个可执行文件
@@ -50,5 +63,13 @@ foreach(src ${CUDA_SOURCES})
             PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
     )
+
+    if (exec_name STREQUAL "gemm_cutlass")
+        target_include_directories(${exec_name}
+                PRIVATE
+                ${CUTLASS_DIR}/include
+                ${CUTLASS_DIR}/tools/util/include
+        )
+    endif()
 
 endforeach()
