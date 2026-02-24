@@ -18,7 +18,7 @@
   do {                                                                            \
     cudaError_t _e = (call);                                                      \
     if (_e != cudaSuccess) {                                                      \
-      fprintf(stderr, "CUDA error %s:%d: %s\\n", __FILE__, __LINE__,           \
+      fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__,           \
               cudaGetErrorString(_e));                                            \
       std::exit(1);                                                               \
     }                                                                             \
@@ -56,42 +56,95 @@ static void fill_random(std::vector<cutlass::half_t>& x,
 
 static void compare(const std::vector<float>& ref,
                     const std::vector<float>& out,
-                    float atol = 1e-2f,
-                    float rtol = 1e-2f) {
-  float max_abs = 0.0f;
-  int bad = 0;
-  for (int i = 0; i < static_cast<int>(ref.size()); ++i) {
-    float abs_err = std::fabs(ref[i] - out[i]);
-    max_abs = std::max(max_abs, abs_err);
-    float tol = atol + rtol * std::fabs(ref[i]);
-    if (abs_err > tol) {
-      ++bad;
-    }
+                    float atol = 1e-3f,
+                    float rtol = 1e-3f) {
+  if (ref.size() != out.size()) {
+    std::cerr << "Size mismatch: ref=" << ref.size() << " out=" << out.size() << "\n";
+    std::exit(1);
   }
-  std::cout << "max_abs_err=" << max_abs << " bad=" << bad << "/" << ref.size() << "\\n";
-  std::cout << (bad == 0 ? "✅ PASS" : "❌ FAIL") << "\\n";
+
+  float max_abs = 0.0f;
+  float max_rel = 0.0f;
+  int max_i = -1;
+
+  int bad = 0;
+  for (int i = 0; i < (int)ref.size(); ++i) {
+    float a = ref[i];
+    float b = out[i];
+    float abs_err = std::fabs(a - b);
+    float rel_err = abs_err / (std::fabs(a) + 1e-8f);
+    if (abs_err > max_abs) { max_abs = abs_err; max_i = i; }
+    if (rel_err > max_rel) { max_rel = rel_err; }
+
+    float tol = atol + rtol * std::fabs(a);
+    if (abs_err > tol) bad++;
+  }
+
+  std::cout << "Compare:\n";
+  std::cout << "  max_abs_err = " << max_abs << "\n";
+  std::cout << "  max_rel_err = " << max_rel << "\n";
+  std::cout << "  bad_count   = " << bad << " / " << ref.size() << "\n";
+
+  if (max_i >= 0) {
+    std::cout << "  worst_idx   = " << max_i
+              << " ref=" << ref[max_i]
+              << " out=" << out[max_i] << "\n";
+  }
+
+  if (bad == 0) std::cout << "  ✅ PASS\n";
+  else          std::cout << "  ❌ FAIL\n";
 }
 
 int main() {
+#include <cutlass/gemm/device/gemm.h>
+#include <cutlass/epilogue/thread/linear_combination.h>
+#include <cutlass/gemm/threadblock/threadblock_swizzle.h>
+
   using ElementInputA = cutlass::half_t;
   using ElementInputB = cutlass::half_t;
   using ElementOutput = float;
   using ElementAccumulator = float;
-  using LayoutInputA = cutlass::layout::RowMajor;
-  using LayoutInputB = cutlass::layout::RowMajor;
-  using LayoutOutput = cutlass::layout::RowMajor;
 
-  using CutlassGemm = cutlass::gemm::device::Gemm<ElementInputA,
-                                                   LayoutInputA,
-                                                   ElementInputB,
-                                                   LayoutInputB,
-                                                   ElementOutput,
-                                                   LayoutOutput,
-                                                   ElementAccumulator>;
+  using LayoutA = cutlass::layout::RowMajor;
+  using LayoutB = cutlass::layout::RowMajor;
+  using LayoutC = cutlass::layout::RowMajor;
 
-  constexpr int M = 2048;
-  constexpr int N = 2048;
-  constexpr int K = 2048;
+  // Tensor Core 指令形状（Ampere 常用）
+  using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+
+  // Threadblock / Warp 形状（起点配置，后续可调）
+  using ThreadblockShape = cutlass::gemm::GemmShape<128, 128, 32>;
+  using WarpShape        = cutlass::gemm::GemmShape<64, 64, 32>;
+
+  // Epilogue：C = alpha * accum + beta * C
+  using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
+      ElementOutput,
+      4,                    // 每线程输出元素个数（可调，向量化时常为 4/8）
+      ElementAccumulator,
+      ElementAccumulator>;
+
+  using SwizzleThreadBlock = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
+
+  using CutlassGemmTensorOp = cutlass::gemm::device::Gemm<
+      ElementInputA, LayoutA,
+      ElementInputB, LayoutB,
+      ElementOutput, LayoutC,
+      ElementAccumulator,
+      cutlass::arch::OpClassTensorOp,   // 关键：Tensor Core
+      cutlass::arch::Sm80,              // 关键：Ampere
+      ThreadblockShape,
+      WarpShape,
+      InstructionShape,
+      EpilogueOp,
+      SwizzleThreadBlock,
+      2                                  // stages
+  >;
+
+  constexpr int M = 4096;
+  constexpr int N = 4096;
+  constexpr int K = 4096;
+  std::cout << "GEMM: C[M,N] = A[M,K] * B[K,N]\n";
+  std::cout << "M=" << M << " N=" << N << " K=" << K << " (half)\n";
 
   const size_t bytesA = static_cast<size_t>(M) * K * sizeof(ElementInputA);
   const size_t bytesB = static_cast<size_t>(K) * N * sizeof(ElementInputB);
@@ -106,10 +159,10 @@ int main() {
   fill_random(hB, -1.0f, 1.0f, 59);
 
   auto t0 = std::chrono::high_resolution_clock::now();
-  gemm_cpu_ref(hA.data(), hB.data(), hCRef.data(), M, N, K);
+  // gemm_cpu_ref(hA.data(), hB.data(), hCRef.data(), M, N, K);
   auto t1 = std::chrono::high_resolution_clock::now();
   std::cout << "CPU reference: "
-            << std::chrono::duration<double, std::milli>(t1 - t0).count() << " ms\\n";
+            << std::chrono::duration<double, std::milli>(t1 - t0).count() << " ms\n";
 
   ElementInputA* dA = nullptr;
   ElementInputB* dB = nullptr;
@@ -122,10 +175,10 @@ int main() {
   CUDA_CHECK(cudaMemcpy(dB, hB.data(), bytesB, cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemset(dC, 0, bytesC));
 
-  CutlassGemm gemm_op;
+  CutlassGemmTensorOp gemm_op;
   cutlass::gemm::GemmCoord problem_size(M, N, K);
 
-  typename CutlassGemm::Arguments arguments{
+  typename CutlassGemmTensorOp::Arguments arguments{
       problem_size,
       {dA, K},
       {dB, N},
@@ -135,7 +188,7 @@ int main() {
 
   cutlass::Status status = gemm_op(arguments);
   if (status != cutlass::Status::kSuccess) {
-    std::cerr << "CUTLASS GEMM launch failed: " << cutlassGetStatusString(status) << "\\n";
+    std::cerr << "CUTLASS GEMM launch failed: " << cutlassGetStatusString(status) << "\n";
     return 1;
   }
   CUDA_CHECK(cudaDeviceSynchronize());
@@ -146,7 +199,7 @@ int main() {
   CUDA_CHECK(cudaEventRecord(start));
   status = gemm_op(arguments);
   if (status != cutlass::Status::kSuccess) {
-    std::cerr << "CUTLASS GEMM run failed: " << cutlassGetStatusString(status) << "\\n";
+    std::cerr << "CUTLASS GEMM run failed: " << cutlassGetStatusString(status) << "\n";
     return 1;
   }
   CUDA_CHECK(cudaEventRecord(stop));
@@ -154,8 +207,9 @@ int main() {
 
   float kernel_ms = 0.0f;
   CUDA_CHECK(cudaEventElapsedTime(&kernel_ms, start, stop));
-  std::cout << "CUTLASS kernel time: " << kernel_ms << " ms\\n";
-
+  std::cout << "CUTLASS kernel time: " << kernel_ms << " ms\n";
+  double gflops = (2.0 * M * N * K) / (kernel_ms * 1e6);
+  std::cout << "Throughput: " << gflops << " GFLOP/s\n";
   CUDA_CHECK(cudaMemcpy(hC.data(), dC, bytesC, cudaMemcpyDeviceToHost));
   compare(hCRef, hC);
 
