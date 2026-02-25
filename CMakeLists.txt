@@ -72,4 +72,11 @@ foreach(src ${CUDA_SOURCES})
         )
     endif()
 
+    if (exec_name STREQUAL "gemm_cublas")
+        target_link_libraries(${exec_name}
+                PRIVATE
+                CUDA::cublas
+        )
+    endif()
+
 endforeach()
