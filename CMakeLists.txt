@@ -61,6 +61,7 @@ file(GLOB CUDA_SOURCES
 # 如果没有 CUTLASS，就移除依赖 CUTLASS 的示例
 if (NOT CUTLASS_AVAILABLE)
     list(REMOVE_ITEM CUDA_SOURCES ${PROJECT_SOURCE_DIR}/src/gemm_cutlass.cu)
+    list(REMOVE_ITEM CUDA_SOURCES ${PROJECT_SOURCE_DIR}/src/conv3d_cutlass.cu)
 endif()
 
 # 如果没有 NVSHMEM，就移除 nvshmem 示例
@@ -90,7 +91,7 @@ foreach(src ${CUDA_SOURCES})
     # -------------------------
     # CUTLASS demo
     # -------------------------
-    if (exec_name STREQUAL "gemm_cutlass")
+    if (exec_name STREQUAL "gemm_cutlass" OR exec_name STREQUAL "conv3d_cutlass")
         target_include_directories(${exec_name}
                 PRIVATE
                 ${CUTLASS_DIR}/include
