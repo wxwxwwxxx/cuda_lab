@@ -100,6 +100,13 @@ int main() {
 #include <cutlass/epilogue/thread/linear_combination.h>
 #include <cutlass/gemm/threadblock/threadblock_swizzle.h>
 
+  // split-K 手动开关：
+  // 1) 把 kEnableSplitK 改成 true 开启 split-K
+  // 2) kSplitKSlices 设为 >1（常见 2/4/8）
+  constexpr bool kEnableSplitK = true;
+  constexpr int kSplitKSlices = 2;
+  const int split_k_slices = kEnableSplitK ? std::max(1, kSplitKSlices) : 1;
+
   using ElementInputA = cutlass::half_t;
   using ElementInputB = cutlass::half_t;
   using ElementOutput = float;
@@ -137,7 +144,10 @@ int main() {
       InstructionShape,
       EpilogueOp,
       SwizzleThreadBlock,
-      2                                  // stages
+      2,                                  // stages
+      8,                                  // AlignmentA
+      8,                                  // AlignmentB
+      true                                // 允许 split-K serial
   >;
 
   constexpr int M = 4096;
@@ -145,6 +155,7 @@ int main() {
   constexpr int K = 4096;
   std::cout << "GEMM: C[M,N] = A[M,K] * B[K,N]\n";
   std::cout << "M=" << M << " N=" << N << " K=" << K << " (half)\n";
+  std::cout << "split_k_slices=" << split_k_slices << "\n";
 
   const size_t bytesA = static_cast<size_t>(M) * K * sizeof(ElementInputA);
   const size_t bytesB = static_cast<size_t>(K) * N * sizeof(ElementInputB);
@@ -184,9 +195,16 @@ int main() {
       {dB, N},
       {dC, N},
       {dC, N},
-      {1.0f, 0.0f}};
+      {1.0f, 0.0f},
+      split_k_slices};
 
-  cutlass::Status status = gemm_op(arguments);
+  void* workspace = nullptr;
+  size_t workspace_bytes = CutlassGemmTensorOp::get_workspace_size(arguments);
+  if (workspace_bytes > 0) {
+    CUDA_CHECK(cudaMalloc(&workspace, workspace_bytes));
+  }
+
+  cutlass::Status status = gemm_op(arguments, workspace);
   if (status != cutlass::Status::kSuccess) {
     std::cerr << "CUTLASS GEMM launch failed: " << cutlassGetStatusString(status) << "\n";
     return 1;
@@ -197,7 +215,7 @@ int main() {
   CUDA_CHECK(cudaEventCreate(&start));
   CUDA_CHECK(cudaEventCreate(&stop));
   CUDA_CHECK(cudaEventRecord(start));
-  status = gemm_op(arguments);
+  status = gemm_op(arguments, workspace);
   if (status != cutlass::Status::kSuccess) {
     std::cerr << "CUTLASS GEMM run failed: " << cutlassGetStatusString(status) << "\n";
     return 1;
@@ -218,5 +236,6 @@ int main() {
   CUDA_CHECK(cudaFree(dA));
   CUDA_CHECK(cudaFree(dB));
   CUDA_CHECK(cudaFree(dC));
+  CUDA_CHECK(cudaFree(workspace));
   return 0;
 }

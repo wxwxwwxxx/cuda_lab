@@ -15,11 +15,7 @@ set(CMAKE_CUDA_ARCHITECTURES native)
 # 你项目里很多 .cu 都是单文件小实验，全局开 RDC 没问题；也可改成对特定 target 开。
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 
-# Debug/RelWithDebInfo flags
-set(CMAKE_CUDA_FLAGS_DEBUG "-G -g")
-set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "-lineinfo -g")
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-fno-omit-frame-pointer")
-set(CMAKE_C_FLAGS_RELWITHDEBINFO "-fno-omit-frame-pointer")
+# Debug/RelWithDebInfo flags are configured per-target below via target_compile_options.
 
 # =========================
 # 查找 CUDA Toolkit（必需）
@@ -86,6 +82,8 @@ foreach(src ${CUDA_SOURCES})
     target_compile_options(${exec_name}
             PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
+            $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:-lineinfo;-G;-g;-Xcompiler=-fno-omit-frame-pointer>
+            $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:RelWithDebInfo>>:-lineinfo;-Xcompiler=-fno-omit-frame-pointer>
     )
 
     # -------------------------
