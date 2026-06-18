@@ -58,18 +58,25 @@ __global__ void gemm_kernel(const half* __restrict__ A,
     auto pipe = cuda::make_pipeline(cta, &pstate);
     //auto pipe = cuda::make_pipeline();
     int n_block_num = N/BN;
-    // int m_block_num = M/BM;
+    int m_block_num = M/BM;
     __shared__ alignas(16) half smemA[2][BM][BK+APAD];
     __shared__ alignas(16) half smemB[2][BK][BN+BPAD];
     // int tid = blockDim.x*blockIdx.x+threadIdx.x;
     int warp_id = threadIdx.x >> 5;
-    int lane_id = threadIdx.x & 31;
-//    int c_tile_y = warp_id >> 2;
-//    int c_tile_x = warp_id & 3;
+    int warp_m_group = warp_id >> 1;
+    int warp_n_group = warp_id & 1;
+    int warp_m_tile = warp_m_group << 1;
+    int warp_n_tile = warp_n_group << 2;
     int cur_buf=0, next_buf=1;
-    int m_pos = (blockIdx.x/n_block_num)*BM;
-    int n_pos = (blockIdx.x%n_block_num)*BN;
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+    constexpr int GROUP_M = 8;
+    int blocks_per_group = GROUP_M * n_block_num;
+    int group_id = blockIdx.x / blocks_per_group;
+    int group_m_start = group_id * GROUP_M;
+    int group_m_count = (m_block_num - group_m_start < GROUP_M) ? (m_block_num - group_m_start) : GROUP_M;
+    int group_offset = blockIdx.x % blocks_per_group;
+    int m_pos = (group_m_start + group_offset % group_m_count) * BM;
+    int n_pos = (group_offset / group_m_count) * BN;
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag[2];
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag[8];
     #pragma unroll
@@ -108,13 +115,23 @@ __global__ void gemm_kernel(const half* __restrict__ A,
             move_data(k_pos+BK,next_buf);
             pipe.producer_commit();
         }
-        // warp id as y, tiled n as x
+        // Each warp computes a 2x4 group of 16x16 WMMA tiles.
         for(int k_step=0;k_step<BK;k_step+=16){
-            wmma::load_matrix_sync(a_frag, &smemA[cur_buf][tile*warp_id][k_step], lda);
-            for(int n_step=0;n_step<8;++n_step)
+            #pragma unroll
+            for(int m_step=0;m_step<2;++m_step)
             {
-                wmma::load_matrix_sync(b_frag, &smemB[cur_buf][k_step][tile*n_step], ldb);
-                wmma::mma_sync(c_frag[n_step], a_frag, b_frag, c_frag[n_step]);
+                wmma::load_matrix_sync(a_frag[m_step], &smemA[cur_buf][tile*(warp_m_tile+m_step)][k_step], lda);
+            }
+            #pragma unroll
+            for(int n_step=0;n_step<4;++n_step)
+            {
+                wmma::load_matrix_sync(b_frag, &smemB[cur_buf][k_step][tile*(warp_n_tile+n_step)], ldb);
+                #pragma unroll
+                for(int m_step=0;m_step<2;++m_step)
+                {
+                    int c_idx = m_step*4+n_step;
+                    wmma::mma_sync(c_frag[c_idx], a_frag[m_step], b_frag, c_frag[c_idx]);
+                }
             }
         }
         pipe.consumer_release();
@@ -123,8 +140,10 @@ __global__ void gemm_kernel(const half* __restrict__ A,
         next_buf ^= 1;
     }
     #pragma unroll
-    for(int n=0;n<8;n++)
-        wmma::store_matrix_sync(&C[(m_pos+warp_id*tile)*N+n_pos+n*tile], c_frag[n], N, wmma::mem_row_major);
+    for(int m=0;m<2;m++)
+        #pragma unroll
+        for(int n=0;n<4;n++)
+            wmma::store_matrix_sync(&C[(m_pos+(warp_m_tile+m)*tile)*N+n_pos+(warp_n_tile+n)*tile], c_frag[m*4+n], N, wmma::mem_row_major);
 }
 
 // CPU reference GEMM: C_ref = A * B

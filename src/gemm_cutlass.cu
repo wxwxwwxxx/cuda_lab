@@ -103,7 +103,7 @@ int main() {
   // split-K 手动开关：
   // 1) 把 kEnableSplitK 改成 true 开启 split-K
   // 2) kSplitKSlices 设为 >1（常见 2/4/8）
-  constexpr bool kEnableSplitK = true;
+  constexpr bool kEnableSplitK = false;
   constexpr int kSplitKSlices = 2;
   const int split_k_slices = kEnableSplitK ? std::max(1, kSplitKSlices) : 1;
 
@@ -126,7 +126,7 @@ int main() {
   // Epilogue：C = alpha * accum + beta * C
   using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
       ElementOutput,
-      4,                    // 每线程输出元素个数（可调，向量化时常为 4/8）
+      8,                    // 每线程输出元素个数（可调，向量化时常为 4/8）
       ElementAccumulator,
       ElementAccumulator>;
 

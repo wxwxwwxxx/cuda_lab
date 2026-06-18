@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
 
+# `native` is convenient, but CUDA 12.8 currently mis-detects RTX 50-series
+# Blackwell GPUs as sm_89 on this machine. Default to sm_120 and let callers
+# override it with -DCMAKE_CUDA_ARCHITECTURES=...
+if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+    set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures to build for")
+endif()
+
 project(cuda_lab LANGUAGES CXX CUDA)
 
 # =========================
@@ -8,9 +15,7 @@ project(cuda_lab LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 
-# 自动匹配本机 GPU（要求 CMake + NVCC 版本支持；若踩坑可改成写死 86）
-set(CMAKE_CUDA_ARCHITECTURES native)
-# 也可以写死：set(CMAKE_CUDA_ARCHITECTURES 80 86 90)
+# 也可以配置多架构：cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES="80;86;89;120"
 
 # 你项目里很多 .cu 都是单文件小实验，全局开 RDC 没问题；也可改成对特定 target 开。
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
